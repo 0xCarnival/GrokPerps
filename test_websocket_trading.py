@@ -32,17 +32,22 @@ class HyperliquidWebSocketTrader:
         self.ws_url = "wss://api.hyperliquid-testnet.xyz/ws" if testnet else "wss://api.hyperliquid.xyz/ws"
         self.wallet_address = os.getenv("HYPERLIQUID_WALLET_ADDRESS")  # Use main wallet that has balance
         self.private_key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
-        self.vault_address = vault_address or os.getenv("HYPERLIQUID_VAULT_ADDRESS")
+        self.vault_address_env = vault_address or os.getenv("HYPERLIQUID_VAULT_ADDRESS")
 
         if not self.wallet_address or not self.private_key:
             raise ValueError("Missing HYPERLIQUID_WALLET_ADDRESS or HYPERLIQUID_PRIVATE_KEY")
+
+        # Determine which wallet to use for trading based on balance (like place_real_order.py)
+        self.trading_wallet = self._get_trading_wallet()
 
         # Initialize SDK Exchange client for correct order signing
         self.base_url = HL_CONST.TESTNET_API_URL if self.testnet else HL_CONST.MAINNET_API_URL
         try:
             self.account = Account.from_key(self.private_key)
-            self.account = Account.from_key(self.private_key)
-            self.exchange = Exchange(self.account, base_url=self.base_url, vault_address=self.vault_address)
+            # Use the trading wallet as the account address for proper vault handling
+            account_address = self.trading_wallet or self.wallet_address
+            vault_address = self.trading_wallet if self.trading_wallet == self.vault_address_env else None
+            self.exchange = Exchange(self.account, base_url=self.base_url, vault_address=vault_address, account_address=account_address)
             # Skip SDK websocket; we manage our own for market data
             logger.info("🧰 Hyperliquid SDK exchange initialized")
         except Exception as e:
@@ -55,7 +60,7 @@ class HyperliquidWebSocketTrader:
         self.order_id_counter = 0
 
         logger.info("🔌 Initialized WebSocket trader for address: {}".format(
-            self.vault_address or self.wallet_address
+            self.trading_wallet
         ))
 
     async def connect(self):
@@ -83,7 +88,8 @@ class HyperliquidWebSocketTrader:
             logger.info(f"📊 Subscribed to {coin} orderbook")
 
     async def place_order_websocket(self, coin: str, is_buy: bool, sz: float,
-                                  order_type: str = "Limit", limit_px: float = None):
+                                  order_type: str = "Limit", limit_px: float = None,
+                                  auto_calculate_size: bool = True):
         """
         Place order via WebSocket. For market orders, use limit orders with tight slippage.
         """
@@ -148,11 +154,7 @@ class HyperliquidWebSocketTrader:
             "signature": signature
         }
 
-        # Add vault address if using vault trading
-        # NOTE: This was causing the request to be dropped silently. The signature is sufficient.
-        # if self.vault_address and self.vault_address != self.wallet_address:
-        #     ws_message["vaultAddress"] = self.vault_address
-        #     logger.info(f"📦 Using vault: {self.vault_address}")
+        # Vault logic handled in place_order_rest method below
 
         # Place via REST /exchange endpoint using the proven working format from place_real_order.py
         logger.info("� Placing order via REST /exchange endpoint...")
@@ -160,70 +162,30 @@ class HyperliquidWebSocketTrader:
         return await self.place_order_rest(coin=coin, is_buy=is_buy, sz=sz, limit_px=limit_px)
 
     async def place_order_rest(self, coin: str, is_buy: bool, sz: float, limit_px: float):
-        """Place order via REST /exchange endpoint using the exact working schema from place_real_order.py."""
+        """Place order via Hyperliquid SDK using the proper API format."""
         try:
-            # Get price for display purposes (if needed)
-            try:
-                response = requests.post('https://api.hyperliquid-testnet.xyz/info', json={"type": "allMids"})
-                mids = response.json()
-            except:
-                mids = {coin: limit_px}
+            logger.info(" Placing order via Hyperliquid SDK...")
 
-            # Calculate order size for ~$4 trade value (adjust as needed)
-            order_sz = round(sz, 3)  # Use provided size
+            # Use the SDK's order method which handles the proper API formatting
+            if self.exchange:
+                # Try with a simpler order type structure
+                result = self.exchange.order(
+                    name=coin,
+                    is_buy=is_buy,
+                    sz=sz,
+                    limit_px=limit_px,
+                    order_type={"limit": {"tif": "Gtc"}},  # Limit order
+                    reduce_only=False
+                )
 
-            # Set limit price slightly above mid-price to act like a limit order
-            limit_price = round(limit_px, 2)  # Round to 2 decimals like working example
-
-            # Build and sign order using EXACT schema from place_real_order.py
-            order = {
-                "coin": coin,
-                "side": "buy" if is_buy else "sell",
-                "sz": str(order_sz),
-                "limit_px": str(limit_price),
-                "order_type": {"type": "Limit"}
-            }
-
-            action = {"type": "order", "orders": [order], "grouping": "na"}
-            nonce = int(time.time() * 1000)
-
-            # Signing process identical to working script
-            action_json = json.dumps(action, separators=(',', ':'))
-            action_hash = Web3.keccak(text=action_json)
-            message_hash = Web3.solidity_keccak(
-                ['bytes32', 'uint64'],
-                [action_hash, nonce]
-            )
-
-            message_to_sign = encode_defunct(message_hash)
-            signed_message = Account.sign_message(message_to_sign, self.private_key)
-            signature_hex = "0x" + signed_message.signature.hex()
-
-            payload = {
-                "action": action,
-                "nonce": nonce,
-                "signature": signature_hex
-            }
-
-            logger.info(f"📤 Sending order payload: {json.dumps(payload, indent=2)}")
-
-            response = requests.post(
-                'https://api.hyperliquid-testnet.xyz/exchange',
-                headers={'Content-Type': 'application/json'},
-                json=payload,
-                timeout=10
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                logger.info(f"📋 Order result: {json.dumps(result, indent=2)}")
-                return result
+                logger.info(f"📋 SDK Order result: {result}")
+                return {"status": "ok", "response": {"data": result}}
             else:
-                logger.error(f"HTTP {response.status_code}: {response.text}")
-                return {"status": "error", "error": f"HTTP {response.status_code}", "text": response.text}
+                logger.error("SDK exchange not initialized")
+                return {"status": "error", "error": "SDK not initialized"}
 
         except Exception as e:
-            logger.error(f"REST order error: {e}")
+            logger.error(f"SDK order error: {e}")
             return {"status": "error", "error": str(e)}
 
     async def _handle_message(self, data: dict):
@@ -293,6 +255,42 @@ class HyperliquidWebSocketTrader:
         if coin in self.market_data:
             return self.market_data[coin].get("mid_price")
         return None
+
+    def _get_trading_wallet(self):
+        """Determine which wallet to use for trading based on balance (like place_real_order.py)."""
+        testnet_url = 'https://api.hyperliquid-testnet.xyz'
+
+        # Always prefer main wallet first (like working script logic)
+        if self.wallet_address:
+            try:
+                response = requests.post(f"{testnet_url}/info",
+                                       json={"type": "clearinghouseState", "user": self.wallet_address}, timeout=5)
+                if response.status_code == 200:
+                    result = response.json()
+                    main_balance = float(result.get("marginSummary", {}).get("accountValue", "0.0"))
+                    if main_balance > 0:
+                        logger.info(f"🏠 Using MAIN wallet (preferred): ${main_balance:.2f}")
+                        return self.wallet_address
+            except Exception as e:
+                logger.warning(f"⚠️ Could not check main wallet: {e}")
+
+        # Fallback to vault if vault configured and we have vault address
+        if self.vault_address_env:
+            try:
+                response = requests.post(f"{testnet_url}/info",
+                                       json={"type": "clearinghouseState", "user": self.vault_address_env}, timeout=5)
+                if response.status_code == 200:
+                    result = response.json()
+                    vault_balance = float(result.get("marginSummary", {}).get("accountValue", "0.0"))
+                    if vault_balance > 0:
+                        logger.info(f"📦 Using VAULT (fallback): ${vault_balance:.2f}")
+                        return self.vault_address_env
+            except Exception as e:
+                logger.warning(f"⚠️ Could not check vault: {e}")
+
+        # If no funded wallet, use main wallet as default
+        logger.warning("⚠️ No funded wallet detected, using main wallet as default")
+        return self.wallet_address
 
     async def close(self):
         """Close WebSocket connection."""
@@ -444,10 +442,11 @@ if __name__ == "__main__":
             slippage = 0.001
             limit_price = current_price * (1 + slippage) if is_buy else current_price * (1 - slippage)
 
+            # Try with much smaller order size to test minimum size requirements
             result = await trader.place_order_websocket(
                 coin=args.coin,
                 is_buy=is_buy,
-                sz=args.size,
+                sz=0.001,  # Much smaller to test minimum order size
                 order_type="Limit",
                 limit_px=limit_price
             )
@@ -464,7 +463,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Place an order via WebSocket.")
     parser.add_argument("--coin", type=str, default="SOL", help="Coin to trade.")
     parser.add_argument("--side", type=str, default="buy", help="Order side (buy/sell).")
-    parser.add_argument("--size", type=float, default=0.054, help="Order size for a ~$10 trade.")
+    parser.add_argument("--size", type=float, default=0.053, help="Order size for a ~$10 trade.")
     args = parser.parse_args()
 
     try:
